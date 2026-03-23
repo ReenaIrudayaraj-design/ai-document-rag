@@ -1,11 +1,15 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import fs from "fs";
 
 import chatRoutes from "./routes/chatRoutes.js";
 import uploadRoutes from "./routes/uploadRoutes.js";
 
 dotenv.config();
+
+// Ensure uploads directory exists
+if (!fs.existsSync("uploads")) fs.mkdirSync("uploads");
 
 const app = express();
 

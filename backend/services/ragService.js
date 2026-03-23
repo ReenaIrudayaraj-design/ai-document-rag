@@ -1,83 +1,97 @@
-import OpenAI from "openai";
-import { cosineSimilarity } from "../utils/similarity.js";
-import { documentStore } from "./pdfService.js";
-import { createEmbedding } from "./embeddingService.js";
+import { ChatGroq } from "@langchain/groq";
+import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
+import { createRetrievalChain } from "langchain/chains/retrieval";
+import { createStuffDocumentsChain } from "langchain/chains/combine_documents";
+import { createHistoryAwareRetriever } from "langchain/chains/history_aware_retriever";
+import { HumanMessage, AIMessage } from "@langchain/core/messages";
+import { getVectorStore } from "./pdfService.js";
 
-const client = new OpenAI({
-    apiKey: process.env.GROQ_API_KEY,
-    baseURL: "https://api.groq.com/openai/v1"
-});
+// In-memory session history (replaces your sessions object)
+const sessions = {};
 
-export const sessions = {};
+// Lazy singleton — created only on first request, after dotenv has loaded
+let llm;
+function getLLM() {
+  if (!llm) {
+    llm = new ChatGroq({
+      apiKey: process.env.GROQ_API_KEY,
+      model: "llama-3.3-70b-versatile",
+      streaming: true,
+    });
+  }
+  return llm;
+}
 
 export async function chatWithRAG(req, res) {
+  const { message, sessionId } = req.body;
 
-    const { message, sessionId } = req.body;
+  // Init session
+  if (!sessions[sessionId]) {
+    sessions[sessionId] = [];
+  }
+  const history = sessions[sessionId];
 
-    //  // check if document uploaded
-    // if (!documentStore || documentStore.length === 0) {
-    //     return res.json({
-    //         message: "Please upload a document first."
-    //     });
-    // }
+  const vectorStore = getVectorStore();
+  if (!vectorStore) {
+    return res.json({ message: "Please upload a document first." });
+  }
 
-     // Create session if not exists
-    if (!sessions[sessionId]) {
-        sessions[sessionId] = [];
-    }
+  // 1. Retriever — retrieve top 3 relavant chunks using cosine similarity (replaces your manual cosineSimilarity + sort)
+  const retriever = vectorStore.asRetriever({ k: 3 });
 
-    // Add user question to session
-    sessions[sessionId].push({
-        role: "user",
-        content: message
-    });
+  const llm = getLLM();
 
-    const questionEmbedding = await createEmbedding(message);
+  // 2. prompts
+  const historyAwarePrompt = ChatPromptTemplate.fromMessages([
+    new MessagesPlaceholder("chat_history"), //history so far
+    ["human", "{input}"], // the new question
+    ["human", "Given the above conversation, generate a standalone search query to retrieve relevant context."],//instruction to llm
+  ]);
 
-    const scoredChunks = documentStore.map(chunk => ({
-        text: chunk.text,
-        score: cosineSimilarity(questionEmbedding, chunk.embedding)
-    }));
-    console.log("Document Store:", documentStore);
-    console.log("Question Embedding:", questionEmbedding);
-    console.log("Scored Chunks:", scoredChunks);
-    scoredChunks.sort((a, b) => b.score - a.score);
-    // Take top 3 relevant chunks
-    const context = scoredChunks
-        .slice(0, 3)
-        .map(c => c.text)
-        .join("\n");
+  const historyAwareRetriever = await createHistoryAwareRetriever({
+    llm,
+    retriever,
+    rephrasePrompt: historyAwarePrompt,
+  });
 
-    const prompt = `
-        Use the context below to answer the question.
+  // 3. QA prompt — prompt template
+  const qaPrompt = ChatPromptTemplate.fromMessages([
+    [
+      "system",
+      `Use the context below to answer the question.
 
-        Context:
-        ${context}
+Context:
+{context}`,
+    ],
+    new MessagesPlaceholder("chat_history"),
+    ["human", "{input}"],
+  ]);
 
-        Question:
-        ${message}
-        `;
+  // 4. Chains — replaces your manual scoredChunks + OpenAI stream loop
+  const documentChain = await createStuffDocumentsChain({ llm, prompt: qaPrompt });
+  const retrievalChain = await createRetrievalChain({
+    combineDocsChain: documentChain,
+    retriever: historyAwareRetriever,
+  });
 
-    const messages = [
-        { role: "system", content: prompt },
-        ...sessions[sessionId]
-    ];
+  // 5. Stream response
+  res.setHeader("Content-Type", "text/plain");
 
-    const stream = await client.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        messages: messages,
-        stream: true
-    });
+  let assistantReply = "";
+  const stream = await retrievalChain.stream({
+    input: message,
+    chat_history: history,
+  });
 
-    res.setHeader("Content-Type", "text/plain");
-    // Stream the response back to the client
-    let assistantReply = "";
-    for await (const chunk of stream) {
-        const content = chunk.choices[0]?.delta?.content || "";
-        assistantReply += content;
-        res.write(content);
-    }
+  for await (const chunk of stream) {
+    const content = chunk.answer ?? "";
+    assistantReply += content;
+    res.write(content);
+  }
 
-    res.end();
+  res.end();
 
+  // Save turn to session history
+  history.push(new HumanMessage(message));
+  history.push(new AIMessage(assistantReply));
 }

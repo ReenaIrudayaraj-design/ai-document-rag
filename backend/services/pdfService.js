@@ -1,40 +1,42 @@
-import fs from "fs";
-//import pdfParse from "pdf-parse";
-import { chunkText } from "../utils/chunkText.js";
-import { createEmbedding } from "./embeddingService.js";
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/hf_transformers";
 
-export const documentStore = [];
-const pdfParse = (await import("pdf-parse/lib/pdf-parse.js")).default;
+// Singleton embeddings model (Xenova/all-MiniLM-L6-v2 — same as before)
+export const embeddings = new HuggingFaceTransformersEmbeddings({
+  modelName: "Xenova/all-MiniLM-L6-v2",
+});
+
+// In-memory vector store (replaces documentStore array + cosineSimilarity)
+let vectorStore = null;
+
+export function getVectorStore() {
+  return vectorStore;
+}
 
 export async function processPDF(req, res) {
-
   try {
-
     console.log("File path:", req.file.path);
-    console.log("File size:", fs.statSync(req.file.path).size);
-    // Read the uploaded PDF file
-    const fileBuffer = fs.readFileSync(req.file.path);
 
-    const pdfData = await pdfParse(fileBuffer);//extraction
+    // 1. Load PDF — replaces pdf-parse + fs.readFileSync
+    const loader = new PDFLoader(req.file.path);
+    const docs = await loader.load();
 
-    const chunks = chunkText(pdfData.text);//chunking
+    // 2. Chunk — replaces your chunkText utility
+    const splitter = new RecursiveCharacterTextSplitter({
+      chunkSize: 500,
+      chunkOverlap: 50, // small overlap so context isn't lost at boundaries
+    });
+    const chunks = await splitter.splitDocuments(docs);
 
-    for (const chunk of chunks) {
-      const embedding = await createEmbedding(chunk);//embedding
-      documentStore.push({
-        text: chunk,
-        embedding
-      });
+    // 3. Embed + store — replaces your for-loop with createEmbedding + documentStore.push
+    vectorStore = await MemoryVectorStore.fromDocuments(chunks, embeddings);
 
-    }
-    console.log(documentStore)
+    console.log(`Stored ${chunks.length} chunks in vector store`);
     res.json({ message: "Document processed successfully" });
-
   } catch (error) {
-
     console.error(error);
     res.status(500).json({ error: "PDF processing failed" });
-
   }
-
 }
