@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-dotenv
+python-multipart
+langchain
+langchain-community
+langchain-groq
+langchain-core
+faiss-cpu
+pypdf
+pydantic
+groq
